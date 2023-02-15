@@ -1,0 +1,19 @@
+# Introduction
+In these notebooks I have tried to document most of the R-analyses I’ve done while in the lab of Hanno and Judith Steen. I myself was heavily focussed on the large-scale analysis of body-fluid samples, but the code provided should be applicable to other cross-sectional or longitudinal studies.
+
+## Learning R
+There is no easy way to learn R. It’s that simple. If you want to use the code I provide here you first need to get a basic understanding. Learning the basics is out of the scope of this documentation. Furthermore, multiple free classes exist online that can teach you the basics. Once you got the basics, come back and play with the provided code :).
+
+## Learning the code provided here
+
+Once you got the basics of R it would be ideal if you have a dataset you know and understand and already created some results out of. Take that one and apply the code here. You can of course just copy and paste and hope for the best, but its an even better idea to figure out why each step is done and what the result of each part of the code is and why it gives the result that is needed.
+
+
+## Suggested online classes
+Do these three courses on EDX (Free) and you can learn the basics.
+
+- https://www.edx.org/course/data-science-r-basics
+- https://www.edx.org/course/data-science-visualization
+- https://www.edx.org/course/data-science-wrangling
+
+Once you’re done, its a matter of keep using R for your analysis. Through trial and error + searching on Google/Stackoverflow + asking your colleagues you can get there.
