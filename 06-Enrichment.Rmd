@@ -1,0 +1,290 @@
+---
+title: "Enrichment"
+output: html_document
+date: "2023-01-31"
+---
+
+## Enrichment analyses
+
+Different enrichment databases exist, and different R-tools exist to utilize such enrichment databases. Here I will show some of the ones I like.
+
+We will use the t-test data I created in chapter 4. To showcase enrichments, I will use the UNADJUSTED p-value, to increase the number of significant proteins. Of course, this is not the best way to do it, but it makes it easy for me to show what one can do in R :).
+
+### Libraries and Import
+```{r, warning=FALSE}
+library(tidyverse)
+library(clusterProfiler)
+library(ggraph)
+library(org.Hs.eg.db)
+library(WebGestaltR)
+library(ReactomePA)
+library(enrichplot)
+library(msigdbr)
+
+ttest_results <- read.csv("ttest_results.csv")
+```
+
+
+### ClusterProfiler
+
+Clusteprofiler is an enrichment package from a yu-lab at Jinan University (China). Its a great package because you can do the following things all in one: 
+
+- Do enrichments using GO, KEGG, Reactome, msgiDB
+- Multitude of vizualizations
+
+For more ideas of vizualization, visit: https://yulab-smu.top/biomedical-knowledge-mining-book/enrichplot.html
+
+#### GO - Without Fold Change
+
+Also commonly called over representation analysis (ORA) we take our significant proteins and enrich for these. When working with a relative small number of proteins such as when working with plasma, its good to use a background. When you have 10k proteins, its of less importance. Long story short; try both out.
+
+I turn it off because otherwise there was nothing significant in this dataset.
+
+```{r}
+#Convert GENE name to ENTREZ ID
+#The package needs ENTREZID, so we need to change that...
+ttest_results <- ttest_results %>%
+  
+  #We also create a column to determine if protein went up or down. We get to this in the next chapter
+  mutate(Direction = ifelse(estimate < 0, "down", "up")) %>%
+  
+  #Forcing it to become characters is important, otherwise it bugs.
+  mutate(entrezID =  as.character(mapIds(org.Hs.eg.db, ttest_results$Gene, "ENTREZID", "SYMBOL"))) 
+
+
+#Get the significant proteins
+significant_ttest <- ttest_results %>%
+  filter(p < 0.05)
+
+
+#Run the Enrichment analysis
+ttest_ORA_GO_BP <- enrichGO(
+  gene=significant_ttest$entrezID, #Put your significant protein
+  
+  #THIS IS WHERE YOU PUT THE BACKGROUND, SO ALL ENTREZID's
+  #universe = ttest_results$entrezID, 
+  
+  #You can select which GO term to search for: BP, CC or MF
+  ont="BP",               
+  
+  #Some standard settings
+  
+  pvalueCutoff=0.05,
+  OrgDb = "org.Hs.eg.db", #for GO only
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05
+)
+
+#You can view the results by running the line below (un-comment it)
+# View(ttest_ORA_GO_BP@result)
+```
+
+Visualization using Dots
+
+```{r}
+dotplot(
+  ttest_ORA_GO_BP,
+  showCategory = 10,
+  title = "dot plot of enriched GO pathways"
+  )
+```
+Gene Network
+
+```{r}
+#This step we do to bring back the gene-names. If you dont do it, you will get numbers instead of gene-names
+ttest_ORA_GO_BP_readable <- setReadable(ttest_ORA_GO_BP, 'org.Hs.eg.db', "ENTREZID")
+
+#plot, there's a few variables you can play with.
+cnetplot(
+  ttest_ORA_GO_BP_readable,
+  showCategory = "leukocyte migration", # INSTEAD YOU CAN PUT A NUMBER AND IT WILL DO THE TOP-X.
+  color_gene = "red",
+  color_category = "blue"
+         )
+```
+Enrichment maps. These do not show unique proteins but instead it plots enrichments that pair together (based on the gene-hits in them).
+
+```{r}
+#You need to run this first. It pairs enrichments together through some scoring mechanism
+ttest_ORA_GO_BP_pairwised <- pairwise_termsim(ttest_ORA_GO_BP)
+
+
+#Plot
+emapplot(
+  ttest_ORA_GO_BP_pairwised,
+  showCategory = 15, #TopX you want to include
+  )
+```
+
+#### GO - Up and Down Split
+
+In some cases, you might want to do a separate enrichment for the proteins that went up and down. This can give some additional insights.
+
+```{r}
+#Create the enrichment again
+ttest_ORA_GO_BP_direction <- compareCluster(
+  entrezID ~ Direction, 
+  data=significant_ttest, 
+  fun = enrichGO, 
+  pvalueCutoff=0.05,
+  OrgDb = "org.Hs.eg.db", #for GO only
+  ont="BP",               #for GO only "CC" "MF" , "BP" 
+  readable = TRUE,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05
+)
+```
+
+Plot for the up and down regulated proteins. As you can see, it indicates where the enrichment only comes from up regulat, downregulated or a mix of both.
+
+```{r}
+ttest_ORA_GO_BP_direction_pairwise <- pairwise_termsim(ttest_ORA_GO_BP_direction)
+
+#Plot
+emapplot(ttest_ORA_GO_BP_direction_pairwise,
+         showCategory = 10)
+```
+#### GO - GSEA
+
+An alternative way to enrich is gene set enrichment analysis (GSEA). Instead of only taking significant proteins, you instead take ALL proteins in your data frame and use an additional score for the enrichment. Commonly, we take a -log10 of the pvalue. Next, we multiply that value by -1 if it was down regulated, this way we also include the direction of the protein, which is required for GSEA.
+
+
+```{r}
+#prepare data for GSEA
+ttest_results_gsea <- ttest_results %>%
+  
+  #Forcing it to become characters is important, otherwise it bugs.
+  mutate(entrezID =  as.character(mapIds(org.Hs.eg.db, ttest_results$Gene, "ENTREZID", "SYMBOL"))) %>%
+  
+  #Apply the -log10
+  mutate(gseaColumn = -1*log10(p)) %>%
+  
+  #add the directionallity
+  mutate(gseaColumn = ifelse(estimate < 0, gseaColumn * -1, gseaColumn)) %>%
+
+  #Finally, we MUST RANK ORDER THE PROTEINS BASED ON THAT NEW COLUMN WITH HIGHEST VALUE ON TOP!
+  dplyr::arrange(-gseaColumn) #minus to force highest on top.
+  
+#GSEA analysis wants a named list as input. Its a bit confusing, but we gotta roll with it.
+gsea_genelist <- ttest_results_gsea$gseaColumn
+names(gsea_genelist) <- ttest_results_gsea$entrezID
+
+#RUN THE ENRICHMENT
+ttest_gsea_GO_BP <- 
+  gseGO(
+    geneList = gsea_genelist,
+    ont="CC",               #for GO only "CC" "MF" , "BP" 
+    
+    #Standard settings.
+    minGSSize = 100,
+    maxGSSize = 500,
+    verbose = F,
+    pvalueCutoff=0.05,
+    OrgDb = org.Hs.eg.db #for GO only
+  )
+
+goplot(ttest_gsea_GO_BP)
+```
+
+```{r}
+#If you want to plot a specific GSEA ranking, you can select them numeric...
+gseaplot(ttest_gsea_GO_BP, geneSetID = 1, by = "runningScore", title = ttest_gsea_GO_BP$Description[1])
+```
+
+#### KEGG Example
+
+We use same package just slighly different function to do KEGG analysis.
+
+```{r}
+#Convert GENE name to ENTREZ ID
+#The package needs ENTREZID, so we need to change that...
+ttest_results <- ttest_results %>%
+  
+  #We also create a column to determine if protein went up or down. We get to this in the next chapter
+  mutate(Direction = ifelse(estimate < 0, "down", "up")) %>%
+  
+  #Forcing it to become characters is important, otherwise it bugs.
+  mutate(entrezID =  as.character(mapIds(org.Hs.eg.db, ttest_results$Gene, "ENTREZID", "SYMBOL"))) 
+
+
+#Get the significant proteins
+significant_ttest <- ttest_results %>%
+  filter(p < 0.05)
+
+
+#Run the Enrichment analysis
+ttest_ORA_KEGG <- enrichKEGG(
+  gene=significant_ttest$entrezID, #Put your significant protein
+  
+  #THIS IS WHERE YOU PUT THE BACKGROUND, SO ALL ENTREZID's
+  #universe = ttest_results$entrezID, 
+  
+  #You need to specify the organism. this is the KEGG identifier
+  organism = "hsa",
+  
+  #Some standard settings
+  pvalueCutoff=0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05
+)
+
+#You can use same vizualizations as for GO
+dotplot(
+  ttest_ORA_KEGG,
+  showCategory = 10,
+  title = "dot plot of enriched KEGG pathways"
+  )
+```
+
+### MSGiDB - HALLMARK and more
+
+MSGiDB is a database by the broad institute which includes a lot, such as the specific HALLMARK pathways. They can be nice to give a shot, check out there website which subpart (or all) you want to test for.
+
+http://www.gsea-msigdb.org/gsea/msigdb/collections.jsp
+
+#### Run Hallmark analysis
+
+```{r}
+#Set the msgidb. We specify HALLMARK, but you can select any (or all by not specifying any) from the weblink above
+all_gene_sets = msigdbr(species = "Homo sapiens", category = "H")
+msigdbr_t2g = all_gene_sets %>%
+  dplyr::distinct(gs_name, gene_symbol) %>%
+  #mutate(gs_name = str_remove_all(gs_name, "HALLMARK_")) %>% #REMOVE ALL THE HALLMARK STUFF
+  as.data.frame()
+
+#Convert GENE name to ENTREZ ID
+#The package needs ENTREZID, so we need to change that...
+ttest_results_hallmark <- ttest_results %>%
+  
+  #We also create a column to determine if protein went up or down. We get to this in the next chapter
+  mutate(Direction = ifelse(estimate < 0, "down", "up"))  
+
+
+#Get the significant proteins
+significant_ttest_hallmark <- ttest_results_hallmark %>%
+  filter(p < 0.05)
+
+#If you want to use a background, do the following
+#BACKGROUND SEEMS TO BE PRETTY STRICT --> NO HITS!
+Background <- data.frame(ttest_results_hallmark$Gene)
+colnames(Background) <- "background"
+
+hallmark_enrichments <- enricher(
+  gene = significant_ttest_hallmark$Gene,
+  #universe = Background$background,
+  TERM2GENE = msigdbr_t2g
+)
+
+#View Results
+#View(hallmark_enrichments@result)
+
+#We can again use some of the Clusteprofiler tools to visualize
+cnetplot(
+  hallmark_enrichments,
+  showCategory = "HALLMARK_XENOBIOTIC_METABOLISM" #select one by looking at the DF
+         )
+
+
+```
+
+

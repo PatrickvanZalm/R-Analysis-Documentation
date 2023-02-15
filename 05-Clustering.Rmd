@@ -1,0 +1,488 @@
+---
+title: "Clustering"
+output: html_document
+date: "2023-01-31"
+---
+
+## Clustering
+
+Different types of clustering will be discussed here, including:
+
+- PCA
+- UMAP
+- PLSDA
+- PVCA
+
+We do not do tSNE because it is:
+
+1. Very tricky in R as it does not keep original sample names (i.e. becomes a mess)
+2. Every plot is different, so not reproducible at all.
+
+
+But first, we briefly talk about imputation.
+
+### Library and import
+```{r}
+library(tidyverse)
+library(rstatix)
+library(mixOmics)
+library(umap)
+library(package = "pvca") # devtools::install_github("dleelab/pvca")
+
+VarCorr <- lme4::VarCorr #install.packages("lme4")
+
+#import the Data
+clinical_and_protein_joined <- read_csv("clinicalAndProtein.csv") 
+clinical_only <- read_csv("clinical.csv")
+```
+
+
+
+### Imputation
+
+When we impute we want to do it on proteins that do not have too many missing values. Commonly, you do a cut off (50% or more) followed by imputation. We often impute by zero or by half the minimum value for a given protein. Lets make data frames for each of these.
+
+#### Prepare the cut off
+
+I do 70% cut off here.
+
+```{r}
+clinical_and_protein_joined_70prct <- clinical_and_protein_joined %>% 
+  mutate(uniqueSamplesInDF = length(unique(SampleID))) %>%
+  group_by(Protein) %>%
+  mutate(countMissingValues = sum(!is.na(Intensity))) %>%
+  mutate(percentageMissing = countMissingValues / uniqueSamplesInDF) %>%
+  filter(percentageMissing > 0.70) %>% # HERE YOU CAN APPLY THE CUT OFF! Here I do 70%
+  dplyr::select(SampleID, DX, Fake_Age, Protein, Intensity) #clean up by selecting the original columns
+```
+
+#### Fill missing with 0
+
+This one is very straightforward. Any NA will be filled with 0.
+
+We also apply a Z-score AFTER the imputation.
+
+```{r}
+#Make a copy
+clinical_and_protein_joined_70prct_imputezero <- clinical_and_protein_joined_70prct
+
+#fill with 0 where is.na
+clinical_and_protein_joined_70prct_imputezero$Intensity[is.na(clinical_and_protein_joined_70prct_imputezero$Intensity)] <- 0
+
+#Z-score
+clinical_and_protein_joined_70prct_imputezero <- clinical_and_protein_joined_70prct_imputezero %>%
+  
+  #Zscore per protein
+  group_by(Protein) %>%
+  mutate(Zscore = scale(Intensity)[,1]) %>%
+  ungroup() %>%
+  
+    #Select only column we want to keep
+  dplyr::select(SampleID, DX, Fake_Age, Protein, Zscore)
+```
+
+#### Fill Missing with half minimum PER protein
+
+Here for each protein in the DF, we determine half the minimum value, and impute with that.
+
+```{r}
+clinical_and_protein_joined_70prct_imputehalfmin <- clinical_and_protein_joined_70prct %>%
+  
+  #Make a temporary column with half the minimum value per protein
+  group_by(Protein) %>%
+  mutate(halfMin = min(Intensity, na.rm = T)) %>%
+  ungroup() %>%
+  
+  #Check if there is a NA, if yes fill. Otherwise fill with original.
+  mutate(Imputed = ifelse(is.na(Intensity), halfMin, Intensity)) %>%
+  
+  #Apply Zscore again.
+  group_by(Protein) %>%
+  mutate(Zscore = scale(Imputed)[,1]) %>%
+  ungroup() %>%
+  
+  #Select only column we want to keep
+  dplyr::select(SampleID, DX, Fake_Age, Protein, Zscore)
+```
+
+
+### PCA
+
+PCA is one of the most classical clustering methods for proteomics. Its an unbiased clustering approach. regular PCA can not handle missing values, so imputation is required making it sometimes tricky. there is a R-package can do it without. 
+
+I will run on the two imputed dataframes, as well as the un-imputed one. We use the mixOmics package.
+
+#### PCA - imputed halfmin
+ 
+The data needs to be provided in a WIDE format, with ONLY the protein quant info!
+
+```{r}
+prepare_pca_imputehalf <- clinical_and_protein_joined_70prct_imputehalfmin %>%
+  
+  #Select the three columns we need. apply WIDE format. Move SampleID into rownames
+  dplyr::select(SampleID, Protein, Zscore) %>%
+  spread(key = Protein, value = Zscore) %>%
+  column_to_rownames("SampleID")
+
+#Run the PCA
+pca_imputehalfmin <- mixOmics::pca(prepare_pca_imputehalf,
+                                   ncomp =2, #With this one, we can limit the number of components. If you need more, just up it.
+                                   center = F #NOTE: THIS DETERMINES IF THE FUNCTION NEEDS TO Zscore. WE ALREADY DID THAT BEFORE!!
+                                   )
+```
+
+For plotting we need to extract:
+
+ 1. The PCA-Location info
+ 2. The PCA proportion values
+
+Its again easy to extract these PCA-location datapoints, re-connect it to the clinical and THEN use ggplot for visualization.
+
+```{r}
+#Extract. This is a bit trickly. No easy way around it; you just have to play with data and try things out.
+pca_imputehalfmin_location <- data.frame(pca_imputehalfmin$variates$X) %>%
+  
+  #Get the samplenames again. Make them numeric.
+  rownames_to_column(var = "SampleID") %>%
+  mutate(SampleID = as.numeric(SampleID)) %>%
+  
+  #join with the clinical data.
+  right_join(clinical_only,
+             by = c("SampleID" = "SampleID"))
+
+#Plot!
+pca_imputehalfmin_location %>%
+  
+  ##ggplot, size of dots three to make it easier to read.
+  ggplot(aes(x = PC1, y = PC2, color = DX)) +
+  geom_point(size = 3) +
+
+  #theme and colouring
+  theme_bw() +
+  scale_color_manual(values = c("lightgrey", "lightgreen", "darkblue", "darkred")) +
+  
+  #Set the component percentages. We extract this as well from the PCA results.
+  #Note again its a bit tricky.... Trial and error gets you there!
+  #NOTE2: the value we extract needs to be multiplied by 100 for percentage.
+  xlab(paste0("PC1 ", 100*round(pca_imputehalfmin$prop_expl_var[[1]][1], 2), "%")) +
+  ylab(paste0("PC2 ", 100*round(pca_imputehalfmin$prop_expl_var[[1]][2], 2), "%")) +
+  
+  ggtitle("PCA with imputation using half minimum value per protein")
+```
+
+#### PCA - imputed 0
+ 
+The data needs to be provided in a WIDE format, with ONLY the protein quant info!
+
+```{r}
+prepare_pca_imputezero <- clinical_and_protein_joined_70prct_imputezero %>%
+  
+  #Select the three columns we need. apply WIDE format. Move SampleID into rownames
+  dplyr::select(SampleID, Protein, Zscore) %>%
+  spread(key = Protein, value = Zscore) %>%
+  column_to_rownames("SampleID")
+
+#Run the PCA
+pca_imputezero <- mixOmics::pca(prepare_pca_imputezero,
+                                   ncomp =2, #With this one, we can limit the number of components. If you need more, just up it.
+                                   center = F #NOTE: THIS DETERMINES IF THE FUNCTION NEEDS TO Zscore. WE ALREADY DID THAT BEFORE!!
+                                   )
+```
+
+For plotting we need to extract:
+
+ 1. The PCA-Location info
+ 2. The PCA proportion values
+
+Its again easy to extract these PCA-location datapoints, re-connect it to the clinical and THEN use ggplot for visualization.
+
+```{r}
+#Extract. This is a bit trickly. No easy way around it; you just have to play with data and try things out.
+pca_imputezero_location <- data.frame(pca_imputezero$variates$X) %>%
+  
+  #Get the samplenames again. Make them numeric.
+  rownames_to_column(var = "SampleID") %>%
+  mutate(SampleID = as.numeric(SampleID)) %>%
+  
+  #join with the clinical data.
+  right_join(clinical_only,
+             by = c("SampleID" = "SampleID"))
+
+#Plot!
+pca_imputezero_location %>%
+  
+  ##ggplot, size of dots three to make it easier to read.
+  ggplot(aes(x = PC1, y = PC2, color = DX)) +
+  geom_point(size = 3) +
+
+  #theme and colouring
+  theme_bw() +
+  scale_color_manual(values = c("lightgrey", "lightgreen", "darkblue", "darkred")) +
+  
+  #Set the component percentages. We extract this as well from the PCA results.
+  #Note again its a bit tricky.... Trial and error gets you there!
+  #NOTE2: the value we extract needs to be multiplied by 100 for percentage.
+  xlab(paste0("PC1 ", 100*round(pca_imputezero$prop_expl_var[[1]][1], 2), "%")) +
+  ylab(paste0("PC2 ", 100*round(pca_imputezero$prop_expl_var[[1]][2], 2), "%")) +
+  
+  ggtitle("PCA with imputation using 0")
+```
+#### PCA - No Imputation
+ 
+The data needs to be provided in a WIDE format, with ONLY the protein quant info!
+
+```{r}
+prepare_pca_noimpute <- clinical_and_protein_joined_70prct %>%
+  
+  #Select the three columns we need. apply WIDE format. Move SampleID into rownames
+  dplyr::select(SampleID, Protein, Intensity) %>%
+  spread(key = Protein, value = Intensity) %>%
+  column_to_rownames("SampleID")
+
+#Run the PCA
+# NOTE HERE WE DO SET CENTER TRUE AS WE DID NOT ZSCORE THE DATA
+pca_noimpute <- mixOmics::pca(prepare_pca_noimpute,
+                                   ncomp =2, #With this one, we can limit the number of components. If you need more, just up it.
+                                   center = T #NOTE: THIS DETERMINES IF THE FUNCTION NEEDS TO Zscore. WE ALREADY DID THAT BEFORE!!
+                                   )
+```
+
+For plotting we need to extract:
+
+ 1. The PCA-Location info
+ 2. The PCA proportion values
+
+Its again easy to extract these PCA-location datapoints, re-connect it to the clinical and THEN use ggplot for visualization.
+
+```{r}
+#Extract. This is a bit trickly. No easy way around it; you just have to play with data and try things out.
+pca_noimpute_location <- data.frame(pca_noimpute$variates$X) %>%
+  
+  #Get the samplenames again. Make them numeric.
+  rownames_to_column(var = "SampleID") %>%
+  mutate(SampleID = as.numeric(SampleID)) %>%
+  
+  #join with the clinical data.
+  right_join(clinical_only,
+             by = c("SampleID" = "SampleID"))
+
+#Plot!
+pca_noimpute_location %>%
+  
+  ##ggplot, size of dots three to make it easier to read.
+  ggplot(aes(x = PC1, y = PC2, color = DX)) +
+  geom_point(size = 3) +
+
+  #theme and colouring
+  theme_bw() +
+  scale_color_manual(values = c("lightgrey", "lightgreen", "darkblue", "darkred")) +
+  
+  #Set the component percentages. We extract this as well from the PCA results.
+  #Note again its a bit tricky.... Trial and error gets you there!
+  #NOTE2: the value we extract needs to be multiplied by 100 for percentage.
+  xlab(paste0("PC1 ", 100*round(pca_noimpute$prop_expl_var[[1]][1], 2), "%")) +
+  ylab(paste0("PC2 ", 100*round(pca_noimpute$prop_expl_var[[1]][2], 2), "%")) +
+  
+  ggtitle("PCA, without imputation")
+```
+### UMAP
+
+Here I will give an example with the 0 imputed data.
+
+```{r}
+#pre the DF for UMAP calculation
+prepare_umap_imputezero <- clinical_and_protein_joined_70prct_imputezero %>%
+  
+  #Select the three columns we need. apply WIDE format. Move SampleID into rownames
+  dplyr::select(SampleID, Protein, Zscore) %>%
+  spread(key = Protein, value = Zscore) %>%
+  
+  column_to_rownames("SampleID")
+
+#Run the UMAP
+umap_results <- umap::umap(prepare_umap_imputezero,
+                           n_components = 2) #You can increase if you want more components
+
+#extract UMAP results, re-combine with clinical again
+umap_results_clinical <- data.frame(umap_results$layout) %>%
+  
+  #Get the samplenames again. Make them numeric.
+  rownames_to_column(var = "SampleID") %>%
+  mutate(SampleID = as.numeric(SampleID)) %>%
+  
+  #join with the clinical data.
+  right_join(clinical_only,
+             by = c("SampleID" = "SampleID"))
+
+#PLOT
+umap_results_clinical %>%
+  
+  ##ggplot, size of dots three to make it easier to read.
+  ggplot(aes(x = X1, y = X2, color = DX)) +
+  geom_point(size = 3) +
+
+  #theme and colouring
+  theme_bw() +
+  scale_color_manual(values = c("lightgrey", "lightgreen", "darkblue", "darkred")) +
+  ggtitle("UMAP on imputed with 0 data")
+```
+
+### PLSDA
+
+This is a biased clustering approach. with that we mean that based on the clinical info you give it, it will try its best to cluster the clinical groups together. Often the proteins it puts the most weight on are also significant in statistical tests, so its a bit of a confirmation.
+
+Nonetheless, the plots look cool.
+
+#### Prepare Data
+
+I use the 70% cut off here.
+
+```{r}
+#Prepare the DF
+prepare_mixomics_proteins <- clinical_and_protein_joined_70prct %>%
+  
+  #Zscore
+  group_by(Protein) %>%
+  mutate(Zscore = scale(Intensity)) %>%
+  ungroup() %>%
+  
+  #select all but clinical info
+  dplyr::select(SampleID, Protein, Zscore) %>%
+  
+  #WIDE format IT
+  spread(key = Protein, value = Zscore) %>%
+  
+  #Move sampleID as rownames
+  column_to_rownames("SampleID")
+
+
+#We do the same spread (without Zscoring). After we select the clinical identifiers we want.
+prepare_mixomics_clinical <- clinical_and_protein_joined_70prct %>%
+  
+  spread(key = Protein, value = Intensity) %>%
+  
+  dplyr::select(SampleID, DX, Fake_Age)
+```
+
+#### Run and Visualize
+
+```{r}
+#create the plsda results
+plsda_results <- plsda(
+  prepare_mixomics_proteins,
+  prepare_mixomics_clinical$DX,
+  ncomp = 2,
+  scale = F)
+
+#Extract the plsda coordinates on the two components (or more if you specified more above)
+plotdf <- plotIndiv(plsda_results)
+
+#Get the explained variance. Bit similair to PCA x or y axis.
+VariateX_1 <- 100*round(plsda_results$prop_expl_var$X[[1]], digits = 3)
+VariateX_2 <- 100*round(plsda_results$prop_expl_var$X[[2]], digits = 3)
+
+#Plot!
+plotdf$df %>% #The dataframe is hidden in this list of item
+  
+  #GGplot
+  ggplot(aes(x = x, y = y, fill = group)) +
+  stat_ellipse(aes(fill = group), geom = "polygon", type = "norm", alpha = 0.1, color = "black")+
+  geom_point(shape = 21, size = 3) +
+  
+  #Colours
+  scale_fill_manual(values = c("lightgrey", "lightgreen", "darkblue", "darkred")) +
+  
+  #Fill the x and y title, using the explained variables we describe above.
+  xlab(paste0("X-variate 1: " , VariateX_1 , "%")) +
+  ylab(paste0("X-variate 2: " , VariateX_2 , "%")) +
+  theme_bw() 
+```
+
+#### Get the loadings
+
+If you want to get the importance of proteins for the loadings on x or y axis, you can extract them like below.
+
+The 'importance' column will tell you about the strength of a given protein on the PLSDA analysis.
+
+```{r}
+#Get the loadings info
+loadings1 <- plotLoadings(plsda_results, method = 'mean', contrib = 'max', comp = 1)
+loadings2 <- plotLoadings(plsda_results, method = 'mean', contrib = 'max', comp = 2)
+```
+
+
+### PVCA
+
+Often times "batch effects" are present in microarray data due to any number of factors, including e.g. a poor experimental design or when the gene expression data is combined from different studies with limited standardization. To estimate the variability of experimental effects including batch, a novel hybrid approach known as principal variance component analysis (PVCA) has been developed. The approach leverages the strengths of two very popular data analysis methods: first, principal component analysis (PCA) is used to efficiently reduce data dimension with maintaining the majority of the variability in the data, and variance components analysis (VCA) fits a mixed linear model using factors of interest as random effects to estimate and partition the total variability. The PVCA approach can be used as a screening tool to determine which sources of variability (biological, technical or other) are most prominent in a given microarray data set. Using the eigenvalues associated with their corresponding eigenvectors as weights, associated variations of all factors are standardized and the magnitude of each source of variability (including each batch effect) is presented as a proportion of total variance. Although PVCA is a generic approach for quantifying the corresponding proportion of variation of each effect, it can be a handy assessment for estimating batch effect before and after batch normalization.
+
+https://www.niehs.nih.gov/research/resources/software/biostatistics/pvca/index.cfm
+
+#### Running PVCA
+
+Like PLSDA, we need to again make a dataframe(WIDE) with the protein info, and another one with the clinical info. Lets do that before running it.
+
+NOTE: PVCA CANT HANDLE MISSING VALUES!!!!!!
+
+```{r}
+#Prepare the DF
+prepare_pvca_proteins <- clinical_and_protein_joined_70prct_imputezero %>%
+  
+  #select all but clinical info
+  dplyr::select(SampleID, Protein, Zscore) %>%
+  
+  #WIDE format IT
+  spread(key = Protein, value = Zscore) %>%
+  
+  #Move sampleID as rownames
+  column_to_rownames("SampleID")
+
+
+#We do the same spread (without Zscoring). After we select the clinical identifiers we want.
+prepare_pvca_clinical <- clinical_and_protein_joined_70prct %>%
+  
+  spread(key = Protein, value = Intensity) %>%
+  
+  dplyr::select(DX, Fake_Age)
+```
+
+Run the PVCA. Here the proteinDF needs SAMPLES as column names, so we transpose it within the function.
+
+It can be tricky because it exactly needs the same number of items in the clinical file as in the protein file(i.e. the number of samples).
+
+Once its run, we extract the values and make a barplot. On it, you will see most of the variance is explained by residuals (i.e. sample specific, which is fine), a portion by the disease state (DX) and a very tiny portion by age. I would not correct for age based on such results. If such a factor is +- 10%, I would start looking into batch corrections.
+
+```{r}
+#Run the PVCA. inter and threshold values are taken directly from IMPACC project. You can play with it if you want but I do not exactly know what they change.
+pvca_results <- pvca::PVCA(
+  counts = t(prepare_pvca_proteins),
+  meta = prepare_pvca_clinical,
+  inter = F,
+  threshold = 0.6
+  )
+
+#Extract the PVCA results to a dataframe.
+pvca_barplot_data <- data.frame(
+  explained = as.vector(pvca_results),
+  effect    = names(pvca_results)
+  ) %>%
+  
+  #arrange from high to low. 
+  arrange(explained)
+
+
+#Plot the data
+pvca_barplot_data %>%
+  ggplot(aes(y = reorder(effect, explained), x = explained)) + #Do note the reorder of y, based on explained. 
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = signif(explained, digits = 3)), #Add number to the barplot
+            nudge_x   = 0.03,
+            size      = 3) +
+  
+  #Title and some theme adjustments.
+  labs(x = NULL, y = "Proportion of the variance explained") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45,
+                                   vjust = 1,
+                                   hjust = 1))
+```
+

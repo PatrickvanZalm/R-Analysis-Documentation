@@ -1,0 +1,298 @@
+---
+title: "04-TtestAndAnova"
+output: html_document
+date: "2023-01-30"
+---
+
+## 04-TtestAndAnova
+
+### Imports
+
+To do these statistics, we use the:
+
+- R-statix package for statistics tests
+- ggebeeswarm to pimp boxplot
+- ggpubr for post-hoc analysis WITHIN the visualization
+- complexheatmap for.... Heatmaps
+- tidyverse for all else
+
+```{r}
+library(rstatix)
+library(tidyverse)
+library(ggpubr)
+library(ggbeeswarm)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+clinical_and_protein_joined <- read_csv("clinicalAndProtein.csv") 
+```
+### Filtering
+
+#### Filter - XX% cut off
+
+When you have a small number of samples its wise to apply a 50 or 70% cut off. Doing so, you reduce the number of proteins you include which helps your multiple testing comparison later on.
+
+```{r}
+clinical_and_protein_joined_90prct <- clinical_and_protein_joined %>% 
+  mutate(uniqueSamplesInDF = length(unique(SampleID))) %>%
+  group_by(Protein) %>%
+  mutate(countMissingValues = sum(!is.na(Intensity))) %>%
+  mutate(percentageMissing = countMissingValues / uniqueSamplesInDF) %>%
+  filter(percentageMissing > 0.90) %>% # HERE YOU CAN APPLY THE CUT OFF! Here I do 70%
+  dplyr::select(SampleID, DX, Fake_Age, Protein, Intensity) #clean up by selecting the original columns
+```
+
+#### Filter - Keep all that have at least two quantifications
+
+In some cases it can be interesting to do an T-test/ANOVA on all proteins possible. To do so, we filter out protein that have less than 2 quantifications PER GROUP!!
+
+```{r}
+clinical_and_protein_joined_possible <- clinical_and_protein_joined %>%
+  
+  #Here its important that we remove any clinical factor. Thus we only select the columns we really need!
+  dplyr::select(SampleID, DX, Protein, Intensity) %>%
+  
+  #First we spread (i.e. back to Wide format, but instead by clinical group)
+  spread(DX, Intensity) %>%
+  group_by(Protein) %>%
+  
+  #Here you need to specify each of the clinical groups you got.
+  summarise(Disease_1 = sum(!is.na(Disease_1)),
+            Disease_2 = sum(!is.na(Disease_2)),
+            disease_3 = sum(!is.na(disease_3)),
+            Control_1 = sum(!is.na(Control_1))) %>%
+  
+  #Create a column where we say that all values need at least 2 to be considered for the statistical test.
+  mutate(possible = ifelse(Disease_1 < 2 | Disease_2 < 2 | disease_3 < 2 | Control_1 < 2, FALSE, TRUE)) %>%
+  filter(possible)
+
+#Now we filter for the proteins we have selected above
+clinical_and_protein_joined_atLeastTwo <- clinical_and_protein_joined %>%
+  filter(Protein %in% clinical_and_protein_joined_possible$Protein)
+```
+
+
+
+### T-test
+
+#### Running T-test
+
+T-test tests based on two groups. We need to filter to select two first before running
+
+```{r}
+# I use the 90% cut off as an example. You can use any. Just be sure that when using 50% for example you might run into issues if you have four groups and you only use two for the T-test.
+ttest_results <- clinical_and_protein_joined_90prct %>%
+  
+  #Filter the groups
+  filter(DX %in% c("Disease_1", "Control_1")) %>%
+  
+  #Run the T-test and adjustments
+  group_by(Protein) %>%
+  t_test(Intensity ~ DX, detailed = T) %>%
+  adjust_pvalue(method = "BH") %>%
+  
+  #Split the Protein name in Uniprot and Gene
+  separate(Protein, c("UniprotID", "Gene")) %>%
+  
+  #Determine Fold change. Since we work with log-transformed values we can just substract
+  mutate(FC = estimate1 - estimate2) %>%
+  
+  #Create log10 p-vals
+  mutate(log10adjustP = -1*log10(p.adj)) %>%
+  
+  #Determine if up or down regulated
+  mutate(Direction = ifelse(p.adj > 0.05, "NotSignificant", ifelse(FC < 0, "Down", "Up")))
+
+
+#NON PARAMETRIC VERSION
+mannWhitney_test <- clinical_and_protein_joined_90prct %>%
+  
+  #Filter the groups
+  filter(DX %in% c("Disease_1", "Control_1")) %>%
+  
+  #Run the T-test and adjustments
+  group_by(Protein) %>%
+  wilcox_test(Intensity ~ DX, detailed = T) %>%
+  adjust_pvalue(method = "BH") %>%
+  
+  #Split the Protein name in Uniprot and Gene
+  separate(Protein, c("UniprotID", "Gene")) %>%
+  
+  #In the mann-whitney they already calculate the estimated differences, which for us is FC.
+  mutate(FC = estimate) %>%
+  
+  #Create log10 p-vals
+  mutate(log10adjustP = -1*log10(p.adj)) %>%
+  
+  #Determine if up or down regulated
+  mutate(Direction = ifelse(p.adj > 0.05, "NotSignificant", ifelse(FC < 0, "Down", "Up")))
+```
+
+#### Visualization - VolcanoPlot
+
+For plotting data ggplot2 (included in tidyverse) is the best thing ever.
+
+We specify what our X, y and colouring(fill) variables are. From there on, we can pimp it up to our liking.
+
+```{r}
+ttest_results %>%
+  ggplot(aes(x = estimate, y = log10adjustP, fill = Direction)) +
+  geom_point(size = 3.5, shape = 21) +
+  scale_fill_manual(values = c("#164db5", "darkgrey", "#d90429")) +
+  theme_bw() +
+  geom_hline(yintercept = 1.3, linetype = 2, alpha = 0.7) +
+  xlab("Coefficient") +
+  ylab("-log10(adjusted p-value)") +
+  theme(legend.position= "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+
+#### Visualization - Boxplot
+ 
+Sometimes you want to plot one or a few specific proteins. If we look at the results dataframe we see that the proteins Q14767_LTBP2 and Q15113_PCOLCE are most significant. Lets plot these.
+
+```{r}
+clinical_and_protein_joined %>%
+  
+  #filter the original two groups, the two proteins and split the proteinnames again.
+  filter(DX %in% c("Disease_1", "Control_1")) %>%
+  filter(Protein %in% c("Q14767_LTBP2", "Q15113_PCOLCE")) %>%
+  separate(Protein, c("UniprotID", "Gene")) %>%
+  
+  #Create the plot
+  ggplot(aes(x = DX, y = Intensity, fill = DX)) +
+  geom_boxplot() +
+  geom_beeswarm(cex = 3, size = 1, color = "black") + #ADDS THE BLACK DOTS TO HELP INTERPRET THE DATA
+  scale_fill_manual(values = c("Control_1" =  "darkgrey", "Disease_1" = "lightgreen")) +
+  theme_bw() +
+  
+  #Split the plots by Gene. If we dont it will combine them which we do NOT want!!!!
+  facet_wrap(~Gene)
+```
+
+
+### ANOVA
+
+#### Running ANOVA
+
+Similar to T-test we use Rstatix anova_test to do the actual testing.
+
+If it prints these "Coefficient covariances computed by hccm()" things, update Rstatix to 0.7.1 or higher.
+
+```{r}
+anova_results <- clinical_and_protein_joined_atLeastTwo %>%
+  drop_na(Intensity) %>%
+  group_by(Protein) %>%
+  anova_test(Intensity ~ DX, detailed = T) %>%
+  adjust_pvalue(method = "BH") %>%  
+  separate(Protein, into = c("Uniprot", "Gene"), sep = "_", remove = F)
+```
+
+
+
+#### Visualization - Boxplot
+
+Same thing as above, but now we do not filter for clinical groups.
+
+We take the same proteins as above again.
+
+Additionally, we can add post-hoc analysis. You might have to play a bit with the y-axis limits to make it fit!!
+
+```{r}
+#We need to specify which comparisons we want post-hoc to do.
+my_comparisons <- list(
+  c("Disease_1", "Disease_2"),
+  c("Disease_1", "disease_3"),
+  c("Disease_1", "Control_1"),
+  c("Disease_2", "disease_3"),
+  c("Disease_2", "Control_1"),
+  c("disease_3", "Control_1")
+  )
+
+
+clinical_and_protein_joined_atLeastTwo %>%
+  filter(Protein %in% c("Q14767_LTBP2", "Q15113_PCOLCE")) %>%
+  
+  #Z-score per protein. You can remove this if you want. Its can be nicer because you will have similar y-values
+  group_by(Protein) %>%
+  mutate(Zscore = scale(Intensity)) %>%
+  
+  #Clean so that you only Gene
+  separate(Protein, c("Uniprot", "Gene")) %>%
+  
+  #plot
+  ggplot(aes(x = DX, y = Zscore, fill = DX)) +
+  geom_boxplot() +
+  geom_beeswarm(cex = 3, size = 1, color = "black") +
+  stat_compare_means(comparisons = my_comparisons) +
+  scale_fill_manual(values = c("lightgrey", "lightgreen", "darkblue", "darkred")) +
+  xlab("") +
+  ylab("Z-scored Intensity") +
+  facet_wrap(~Gene) +
+  theme_bw() +
+  theme(
+    axis.title.x=element_blank(),
+    axis.text.x=element_blank(),
+    axis.ticks.x=element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())
+```
+
+#### Visualization - Heatmap
+
+Sometimes its nicer to plot ALL significant proteins in a heatmap. We can do that using the ComplexHeatmap Package.
+
+For the heatmap we need a WIDE format dataframe, not a long(tidy) format. Its likely one of the few cases where wide is needed. Furthermore, we need a separate dataframe for the clinical values, and one for the protein info.
+
+```{r}
+#Filter for significant proteins, remove all clinical.
+heatmap_wideDF_protein <- clinical_and_protein_joined_atLeastTwo %>%
+  filter(Protein %in% 
+           filter(anova_results, p.adj < 0.05)$Protein) %>%
+  group_by(Protein) %>%
+  mutate(Intensity = scale(Intensity)) %>%
+  ungroup() %>%
+  spread(key = "Protein", 
+         value = "Intensity") %>%
+  select(-SampleID, -DX, -Fake_Age) 
+
+#If you want the clinical variables on top (as we do here) you also need to put the sample names as columns. Thus we transpose.
+heatmap_wideDF_protein <- data.frame(t(heatmap_wideDF_protein))
+
+#filter for significant proteins, keep only clinical
+heatmap_wideDF_clinical <- clinical_and_protein_joined_atLeastTwo %>%
+  filter(Protein %in% 
+           filter(anova_results, p.adj < 0.05)$Protein) %>%
+  spread(key = "Protein", 
+         value = "Intensity") %>%
+  select(SampleID, DX, Fake_Age)
+
+#Make the annotation (i.e. clinical variable info) for the Heatmap
+heatmap_clinical_info <- HeatmapAnnotation(
+  Age = anno_points(heatmap_wideDF_clinical$Fake_Age),
+  DX = heatmap_wideDF_clinical$DX,
+  col = list( #IN HERE WE SPECIFY COLOURS. THIS IS CURRENTLY ONLY RELEVANT FOR DISEASE!
+    DX = c("Disease_1" = "lightgreen",
+           "Disease_2" = "darkblue",
+           "disease_3" = "darkred",
+           "Control_1" = "lightgrey")
+  )
+)
+
+#make the Heatmap
+Heatmap(
+  as.matrix(heatmap_wideDF_protein),
+  
+  #Specify some things. You can look up the package for whatever you want to change
+  column_title_rot = 90,
+  column_title_gp = gpar(fontsize=10),
+  
+  show_column_names = F,
+  show_row_names = F,
+  border_gp = gpar(col = "black", lwd = 1),
+  top_annotation = heatmap_clinical_info
+  )
+```
+
+
+

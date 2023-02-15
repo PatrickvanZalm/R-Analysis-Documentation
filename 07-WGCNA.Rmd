@@ -1,0 +1,339 @@
+---
+title: "WGCNA"
+output: html_document
+date: "2023-01-31"
+---
+
+## WGCNA
+
+WGCNA is a method to cluster a group of features (here proteins) into clusters which are then called modules. This can be nice to find clusters of proteins that behave similair, which you can then do statistics on as a group itself (instead of a number of proteins) and you can do enrichment analyses on such groups.
+
+In here I will show you how to:
+
+- prepare data for WGCNA
+- run the WGCNA, and what variables to look for
+- Plot the WGCNA
+- Do basic statistics on modules
+- Do some enrichment analysis on modules
+
+
+for more info on WGCNA:
+
+- https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/Simulated-00-Background.pdf
+- https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/
+
+### Libraries
+
+```{r}
+library(tidyverse)
+library(WGCNA)
+library(rstatix)
+library(ggpubr)
+library(ggbeeswarm)
+library(msigdbr)
+library(clusterProfiler)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+
+#import the Data
+clinical_and_protein_joined <- read_csv("clinicalAndProtein.csv") 
+clinical_only <- read_csv("clinical.csv")
+```
+
+
+### Run WGCNA
+
+#### Cut off
+
+WGCNA does not like missing values too much. Play around and see if it works. I apply 70% for showing purposes
+```{r}
+#Apply a cut-off
+clinical_and_protein_joined_70prct <- clinical_and_protein_joined %>% 
+  mutate(uniqueSamplesInDF = length(unique(SampleID))) %>%
+  group_by(Protein) %>%
+  mutate(countMissingValues = sum(!is.na(Intensity))) %>%
+  mutate(percentageMissing = countMissingValues / uniqueSamplesInDF) %>%
+  filter(percentageMissing > 0.70) %>% # HERE YOU CAN APPLY THE CUT OFF! Here I do 70%
+  dplyr::select(SampleID, DX, Fake_Age, Protein, Intensity) #clean up by selecting the original columns
+```
+
+
+#### Prepare Data
+
+For WGCNA we need the data in a WIDE format. This is one of the cases where this is indeed needed. Following is required:
+
+- The dataframe can ONLY have numeric values. So no clinical grouping columns or anything
+- Whatever is in the columns, will be clustered in WGCNA. I would suggest proteins there, but Hanno has asked samples before so its good to know...
+
+
+```{r}
+WGCNA_data_prepare <- clinical_and_protein_joined_70prct %>%
+  dplyr::select(SampleID, Protein, Intensity) %>%
+  spread(key = Protein, value = Intensity) %>%
+  column_to_rownames("SampleID") #NOTE, HERE I PUT SAMPLEID as ROWNAME
+```
+
+### WGCNA
+
+#### Run
+
+There's a lot of variables you can and some you should not play with without knowing what your doing.
+
+following you can play with: 
+- power --> set higher lower, based on how it looks in the heatmap (downstream)
+- minModuleSize --> depeding on the number of proteins you got you might in or decrease this. Roughly 5 to 25 modules is nice to have. More or less and it becomes a bit difficult.
+- corType --> 'pearson' or 'bicor'. For proteomics I like bicor more.
+- maxPOutliers --> Only play around with when selecting bicor for cortype. 0.1 worked well often, but again; one can play with it.
+- verbose --> integer level of verbosity. Zero means silent, higher values make the output progressively more and more verbose.
+- deepSplit --> nteger value between 0 and 4. Provides a simplified control over how sensitive module detection should be to module splitting, with 0 least and 4 most sensitive.
+ 
+```{r}
+#Run the WGCNA
+WGCNA_results <- blockwiseModules(
+  datExpr = WGCNA_data_prepare,
+  networkType = "signed",
+  power = 20,
+  minModuleSize = 20,
+  corType = "bicor",
+  maxPOutliers = 0.1,
+  verbose = 3,
+  deepSplit = 4,
+  
+  #Standard settings below.
+  reassignThreshold = 1e-6,
+  mergeCutHeight = 0.15,
+  minKMEtoStay = 0.3,
+  minCoreKME = 0.5,
+  TOMType = "unsigned",
+  numericLabels = T,
+  pamRespectsDendro = F
+  
+)
+```
+
+#### Extract colours + Dendrogram
+
+The WGCNA is now created. Lets grab the results and plot it in a Heatmap.
+
+```{r}
+#Get module colours
+mergedcolors <- labels2colors(WGCNA_results$colors)
+module_labels = paste0("mod",WGCNA_results$colors) %>% setNames(names(WGCNA_results$colors))
+module_color_key = labels2colors(unique(WGCNA_results$colors)) %>% setNames(paste0("mod",unique(WGCNA_results$colors)))
+
+#Plot the colour dendorgram
+    # Plot the dendrogram and the module colors underneath
+    plotDendroAndColors(
+      WGCNA_results$dendrograms[[1]],
+      mergedcolors[WGCNA_results$blockGenes[[1]]],
+      "Module colors",
+      dendroLabels = FALSE,
+      hang = 0.03,
+      addGuide = TRUE,
+      guideHang = 0.05
+    )
+```
+#### Heatmap
+
+```{r}
+#Define for each of the proteins which modules it is part of.  NOTE, module 0 means it wasnt added to any.
+module_membership = data.frame( feature = colnames(WGCNA_data_prepare), module = module_labels )
+module_for_plot = module_membership$module #Need this one for the plot below.
+
+#change the WGCNA input data to a matrix
+#This is needed for the ComplexHeatmap.... Its confusing!
+WGCNA_data_prepare_matrix <- as.matrix(scale(WGCNA_data_prepare)) #Do note the scale! This is column-wise Z-scoring
+
+#Create the Heatmap
+Heatmap(
+  WGCNA_data_prepare_matrix, #Data that we Z-scored and put in matrix format above.
+  column_split = module_membership$module, #The modules
+  top_annotation = columnAnnotation(
+    modules = module_for_plot,
+    col=list(modules = module_color_key),
+    show_legend = FALSE,
+    show_annotation_name = FALSE),
+  show_column_names = F,
+  show_row_names = F,
+  column_title_rot = 90,
+  column_title_gp = gpar(fontsize=10)
+)
+```
+#### Heatmap - With Clinical
+
+If you're happy with your WGCNA clustering, or you want to add the clinical info anyway here's the way to do it. We need to make an additional little dataframe with our clinical factors.
+
+```{r}
+WGCNA_clinicalInfo <- clinical_and_protein_joined_70prct %>%
+  spread(key = Protein, value = Intensity) %>% #spread like we do before
+  select(SampleID, DX, Fake_Age)  #Select only columns of interest
+
+#Repeat the plotting as above, but with left_annotation
+#Create the Heatmap
+Heatmap(
+  WGCNA_data_prepare_matrix, #Data that we Z-scored and put in matrix format above.
+  column_split = module_membership$module, #The modules
+  top_annotation = columnAnnotation(
+  modules = module_for_plot,
+  col=list(modules = module_color_key),
+  show_legend = FALSE,
+  show_annotation_name = FALSE),
+  show_column_names = F,
+  show_row_names = F,
+  column_title_rot = 90,
+  column_title_gp = gpar(fontsize=10),
+  
+  #Define clinical annotations
+  left_annotation = rowAnnotation(
+    DX = WGCNA_clinicalInfo$DX,
+    Age = anno_points(WGCNA_clinicalInfo$Fake_Age), #anno points makes the (I think) nice dots. See Complexheatmap website for more ideas.
+    col = list(
+      DX = c("Control_1" = "lightgrey",
+             "Disease_1" = "lightgreen",
+             "Disease_2" = "darkblue",
+             "disease_3" = "darkred"))
+    )
+)
+```
+
+
+### Modules - Statistics 
+
+Instead of doing a t-test or ANOVA on single genes, we can also do it on the modules. To do so, we need to do the following:
+
+- extract module quant info (called eigengenes)
+- Connect this to our clinical data
+- Run our statistics
+- Visualization
+
+
+#### Extract module-quant from the WGCNA
+
+The WGCNA package has a function to extract this info. We just use that.
+
+```{r}
+# Recalculate module eigengenes with module labels
+moduleQuants <- moduleEigengenes(
+  WGCNA_data_prepare, #ORIGINAL DF OF WGCNA!
+  module_labels
+  )
+
+#Inside now there's multiple dataframes, such as eigengenes, averagexpression or variance. Here we take eigengenes and re-write it
+moduleQuants <- moduleQuants$eigengenes
+```
+
+#### Connect to Clinical
+
+```{r}
+# We do three steps to prepare for joining with the clinical data
+# 1. Re-create the clinical sampleID column 
+# 2. Make into long format
+# 3. make the clinical sampleID column numeric
+moduleQuants <- moduleQuants %>%
+  
+  #Re-get the rownames.
+  rownames_to_column(var = "SampleID") %>%
+  
+  # Make it into long format. I specify colnames because at this point we have not overwritten it yet, thus we can take that.
+  gather(colnames(moduleQuants), key = "module", value = "eigengenes") %>%
+  
+  #In our clinical dataframes the SampleID is describes as numeric, not character. Thus we need to change that.
+  #This again really depends on your own clinical data. It can be tricky and need a bit of trial and error..
+  mutate(SampleID = as.numeric(SampleID))
+
+#Combine with the clinical data
+moduleQuants_clinical <- inner_join(
+  clinical_only,
+  moduleQuants,
+  by = c("SampleID" = "SampleID")
+)
+```
+#### Module - Anova
+
+We run the anova_test similair to how we done in chapter 4. 
+
+```{r}
+#Run ANOVA
+moduleQuants_anova <- moduleQuants_clinical %>%
+  group_by(module) %>%
+  anova_test(eigengenes ~ DX, detailed = T) %>%
+  
+  #Apply BH correction
+  ungroup() %>%
+  adjust_pvalue(method = "BH")
+```
+
+#### Visualize - boxplot
+
+Looking at the anova results data we notice that modules 1 and 4 are significant. Lets make boxplots and also apply that pairwise test we've done before in chapter 4.
+
+```{r}
+#We need to specify which comparisons we want post-hoc to do.
+my_comparisons <- list(
+  c("Disease_1", "Disease_2"),
+  c("Disease_1", "disease_3"),
+  c("Disease_1", "Control_1"),
+  c("Disease_2", "disease_3"),
+  c("Disease_2", "Control_1"),
+  c("disease_3", "Control_1")
+  )
+
+
+moduleQuants_clinical %>%
+  filter(module %in% c("MEmod1", "MEmod4")) %>%
+  
+  #plot
+  ggplot(aes(x = DX, y = eigengenes, fill = DX)) +
+  geom_boxplot() +
+  geom_beeswarm(cex = 3, size = 1, color = "black") +
+  stat_compare_means(comparisons = my_comparisons) +
+  scale_fill_manual(values = c("lightgrey", "lightgreen", "darkblue", "darkred")) +
+  xlab("") +
+  ylab("eigengenes") +
+  facet_wrap(~module) +
+  theme_bw() +
+  theme(
+    axis.title.x=element_blank(),
+    axis.text.x=element_blank(),
+    axis.ticks.x=element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())
+
+
+```
+
+### Enrichment of Modules
+
+Of course it is also interesting to enrich for the specific modules. Here I apply the hallmark-enrichment as we did in the enrichment chapter.
+
+```{r}
+#Set the msgidb. We specify HALLMARK, but you can select any (or all by not specifying any) from the weblink above
+all_gene_sets = msigdbr(species = "Homo sapiens", category = "H")
+msigdbr_t2g = all_gene_sets %>%
+  dplyr::distinct(gs_name, gene_symbol) %>%
+  #mutate(gs_name = str_remove_all(gs_name, "HALLMARK_")) %>% #REMOVE ALL THE HALLMARK STUFF
+  as.data.frame()
+
+# Specify the background (i.e. all proteins) if you want
+hallmark_background <- module_membership %>%
+  separate(feature, sep = "_", into = c("Uniprot", "Gene"))
+
+#Filter module 1
+hallmark_module1 <- hallmark_background %>%
+  filter(module == "mod1")
+
+#Run Enrichment
+WGCNA_hallmark_enrich_mod1 <- enricher(
+  gene = hallmark_module1$Gene,
+  universe = hallmark_background$Gene,
+  TERM2GENE = msigdbr_t2g
+)
+
+#View Results
+#View(hallmark_enrichments@result)
+
+#We can again use some of the Clusteprofiler tools to visualize
+cnetplot(
+  WGCNA_hallmark_enrich_mod1
+         )
+```
+

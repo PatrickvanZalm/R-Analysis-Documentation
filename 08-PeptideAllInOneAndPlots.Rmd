@@ -1,0 +1,521 @@
+---
+title: "PeptideAllInOneAndPlots"
+output: html_document
+date: "2023-01-31"
+---
+
+## Peptide All-in-One and Plots
+
+Sometimes we want to do peptide-level analyses. There's a lot of statistics one can do, here I created a function that can do all automaticly (it will take a whole though). It is important to know that we do need the FASTA file, because we want to identify for each peptide the protein length and at which location the peptide originates from.
+
+
+### Libraries
+
+
+```{r}
+library(rstatix)
+library(tidyverse)
+
+#We need yardstick for AUROC's
+library(yardstick)
+
+#Add library for FASTA
+library(seqinr)
+```
+
+
+### Imports
+
+```{r}
+#Import the peptide level data
+peptide_level_data <- read_csv("Cleaned_diaNN_peptideMatrix.csv")
+
+#This dataframes has a lot of unique proteins in it. The statistics will take long. 
+# Thus, I selected 5 proteins that had a nice number of peptides to its name. Just for showing purposes.
+peptide_level_data_50proteins <- peptide_level_data %>%
+  separate(Protein, sep = "_", into = c("Uniprot", "Gene", "Peptide"), remove = F) %>%
+  filter(Gene %in% c("TMSB4X", "APOH", "VASP", "CFI", "NACA")) %>%
+  select(- Uniprot, - Gene, - Peptide)
+
+#FASTA FILE
+myFastaFile <- seqinr::read.fasta(
+  file = "UP000005640_9606_SARS_COV_2_BJOERN.fasta",
+  seqtype = "AA",
+  as.string = T)
+
+#Clinical data
+clinical_data <- read_csv("Clinical.csv")
+clinical_data <- clinical_data %>%
+  mutate(SampleID = as.character(SampleID))
+```
+
+### Combine peptide and clinical data
+
+See chapter 3 for more details.
+
+```{r}
+#Prepare the sample ID names
+peptide_level_data_50proteins <- peptide_level_data_50proteins %>%
+  separate(Sample, sep = "_", into = c("Acquistion", "sampleNumber", "PlateInfo", "timsTOF_stuff", "runOrder")) %>%
+  dplyr::select(Protein, sampleNumber, Intensity) 
+
+#Join the two.
+clinical_and_peptides <- inner_join(
+  clinical_data,
+  peptide_level_data_50proteins,
+  by = c("SampleID" = "sampleNumber")
+)
+```
+### Multiple-statistical-tests-in-one
+
+#### Function
+
+This one is long, as we do many statistical tests in one and join the dataframes together. The comments below should explain each step.
+
+```{r}
+all_in_one <- function(dataset, sampleName, grouping, protOrPepName, intensityName, addOriginal = TRUE) {
+
+#do some column renaming so we are sure it will work downstream within this function
+  dataset <- dataset %>%
+    mutate(sampleName = get(sampleName),
+           grouping = get(grouping),
+           protOrPepName = get(protOrPepName),
+           intensityName = get(intensityName)) %>%
+    dplyr::select(sampleName, grouping, protOrPepName, intensityName)
+    
+    print("Start Fisher Tests")
+
+  #Fisher Tests
+  dataset_counts <- 
+    dataset %>%
+    dplyr::select(sampleName, grouping, protOrPepName, intensityName) %>%
+    group_by(protOrPepName, grouping) %>%
+    
+    #Count the number of quantified proteins (and vice-verca, missing)
+    summarise(Quantified = sum(!is.na(intensityName)),
+              Missing = sum(is.na(intensityName))) %>%
+    ungroup() %>%
+    
+    #run fisher test for each of the prot/peptides
+    group_by(protOrPepName) %>%
+    mutate(p_fisher = fisher.test(matrix(c(Quantified, Missing), nrow =2))$p) %>%
+    
+    #Make some of the columns into wide format as this will be nicer to join and write to csv downstream.
+    pivot_wider(names_from = grouping,
+                values_from = c(Quantified, Missing)) %>%
+    relocate(p_fisher, .after = last_col()) %>%
+    
+    #Run p.adjustment
+    ungroup() %>%
+    mutate(padj_fisher = p.adjust(p_fisher, method = "BH"))
+
+  print("Fisher Done")
+  
+  #Determine which proteins have at least two quants in the groups
+  #We use this for both statistical tests as well as AUROC's
+  dataset_possible <- dataset %>%
+    dplyr::select(sampleName, grouping, protOrPepName, intensityName) %>%
+    
+    #check if value is NA
+    mutate(isAValue = ifelse(is.na(intensityName), 0, 1)) %>%
+    group_by(protOrPepName, grouping) %>%
+    
+    #count NA's per protein per group
+    summarise(count = sum(isAValue)) %>%
+    ungroup() %>%
+    group_by(protOrPepName) %>%
+    
+    #if any of the groups for a given protein has less than two quants, write FALSE
+    #The false column is used to filter proteins out we do not want to do any statistics on.
+    mutate(dropColumn = ifelse(any(count < 2), F, T)) %>%
+    ungroup() %>%
+    filter(dropColumn)
+    
+  
+  
+  #Create list of all possible pairwise combinations of the clinical groups provided
+  aurocPossibleCombinations <- apply(combn(unique(dataset$grouping),2),2,paste,collapse='-')
+  
+  #Based on that list, we keep duplicating the dataframe to include all potential combinations as unique numbers.
+  AurocDF <- data.frame(matrix(ncol = ncol(dataset), nrow = 0))
+  colnames(AurocDF) <- colnames(dataset)
+  for (possibleComparison in aurocPossibleCombinations){
+    dataset_temp <- dataset %>%
+      mutate(comparison = possibleComparison)
+    AurocDF <- rbind(AurocDF, dataset_temp)
+    
+  }
+  
+  #AUROC function
+  Auroc_results <- AurocDF %>%
+    
+    #filter for the ones with at least two quants
+    filter(protOrPepName %in% dataset_possible$protOrPepName) %>%
+    
+    #Here we split the comparison column we created above. 
+    #next, we check whether our grouping variable correpsonds to one of the two comparison variables
+    #if yes, give it a binary (i.e. 0 or 1)
+    #Next, we put the binary columns into one long one, followed by removing NA's
+    separate(comparison, sep = "-", into = c("first", "second"), remove = F) %>%
+    mutate(binaryStatusFirst = ifelse(grouping == first, 1, NA),
+           binaryStatusSecond = ifelse(grouping == second, 0, NA)) %>%
+    gather(c(binaryStatusFirst, binaryStatusSecond), key = "test", value = "binaryStatus") %>%
+    drop_na(binaryStatus) %>%
+    
+    #We want to do a single AUROC for a combination of comparison and prot/peptide
+    # we select the columns we need. Factorize the binarystatus column and run the ROC for the groupings
+    #After, select columns of interest and spread them so they can be combined with the other analyses later on.
+    dplyr::select(comparison, protOrPepName, binaryStatus, intensityName) %>%
+    mutate(binaryStatus = as.factor(binaryStatus)) %>%
+    group_by(comparison, protOrPepName) %>%
+    roc_auc(truth = binaryStatus, intensityName) %>%
+    dplyr::select(comparison, protOrPepName, .estimate) %>%
+    ungroup() %>%
+    mutate(comparison = paste0("AUROC_", comparison)) %>%
+    spread(comparison, .estimate)
+  
+  print("AUROC Done")
+  
+  # Run the ANOVA
+  anova_results <- dataset %>%
+    
+    #filter for the ones with at least two quants
+    filter(protOrPepName %in% dataset_possible$protOrPepName) %>%
+    
+    drop_na(intensityName) %>%
+    group_by(protOrPepName) %>%
+    anova_test(intensityName ~ grouping, detailed = T) %>%
+    adjust_pvalue(method = "BH") 
+    
+    #Somehow doing this stuff we cant do direct. Need to transform it to a dataframe...
+    anova_results <- data.frame(anova_results) %>%
+    mutate(p_ANOVA = p,
+           padj_ANOVA = p.adj) %>%
+    dplyr::select(protOrPepName, p_ANOVA, padj_ANOVA)
+
+  pairwise_results <- AurocDF %>%
+    
+    #filter for the ones with at least two quants
+    filter(protOrPepName %in% dataset_possible$protOrPepName) %>%
+    
+    #Run all T-tests.
+    drop_na(intensityName) %>%
+    group_by(protOrPepName) %>%
+    t_test(intensityName ~ grouping, detailed = T) %>%
+    
+    
+    #Create the comparisons, p-value, and FC columns
+    mutate(
+      comparison = paste0(group1, "_", group2),
+      FC = estimate,
+      pvalue = p
+    ) %>%
+    dplyr::select(protOrPepName, comparison, FC, pvalue) %>%
+    
+    #Ungroup and regroup based on comparison. We want to only to p-value adjust for these.
+    ungroup() %>%
+    group_by(comparison) %>%
+    mutate(adj_pvalue = p.adjust(pvalue, method = "BH")) %>%
+      
+    #Widen the DF so it can fit with the other
+    pivot_wider(
+      names_from = comparison,
+      values_from = c(FC, pvalue, adj_pvalue),
+      names_glue = "{comparison}_{.value}" #Change how we put names together other way around
+    )
+  
+  print("pairwise Results done!")
+    
+  #Now we can add the dataframes together! In some cases the original DF is very big, so we might not want to add it.
+  #to do so, we have an additional variables in the function that we check.
+  if (addOriginal == FALSE){
+    
+    #add all plus original together
+  dataset_final <- dataset_counts %>%
+    left_join(Auroc_results) %>%
+    left_join(anova_results) %>%
+    left_join(pairwise_results) 
+    
+  } else {
+    #add all without original together
+    dataset_wide <- dataset %>%
+      dplyr::select(protOrPepName, sampleName, intensityName) %>%
+    spread(sampleName, intensityName)
+  
+  dataset_final <- dataset_counts %>%
+    left_join(Auroc_results) %>%
+    left_join(anova_results) %>%
+    left_join(pairwise_results) %>%
+    left_join(dataset_wide)
+  
+  
+  }
+  
+  #Return the results data
+  return(dataset_final)
+}
+```
+
+
+#### Usage
+
+See below how one would use the function. One only needs to specify the columns, that is all.
+It would work on both protein and peptide-level data too!!
+
+```{r}
+
+resultsDF <- all_in_one(dataset =  clinical_and_peptides, 
+                        sampleName = "SampleID",
+                        grouping = "DX",
+                        protOrPepName = "Protein",
+                        intensityName = "Intensity",
+                        addOriginal = TRUE)
+```
+
+### Add FASTA info - peptidelevel
+
+With the resultsDF we now have a lot of statistical info, but if we want to visualize this over the protein sequence, we need FASTA info too. This is added separate.
+
+#### Functions
+
+```{r}
+#The function itself. we need info on the FASTA variable. the input dataset and which one is the peptide and Uniprot column
+addFASTAinfo <- function(FASTA, dataset, column_peptide, column_uniprot){
+
+  #Fix FASTA stuff.
+  myFastaFile_Annot <- getAnnot(object = FASTA)
+  
+  #Function to extract the proteinsequence, will be used in the functionm below
+  proteinStringFunction <- function(UniprotID, StrippedPeptide) {
+    
+    #Define the results if they can not be found
+    proteinSeq <- "noProteinSequence"
+    proteinSeq_nchar <- 9999999
+    peptideLength <- 9999999
+    start_position <- 9999999
+    AA_before <- "NoAABefore"
+    AA_after <- "NoAAAfter"
+    
+    #Get the protein seq
+    try(proteinSeq <- myFastaFile[grep(UniprotID, myFastaFile_Annot)][[1]][1])
+    
+    #determine protein and peptide length
+    try(proteinSeq_nchar <- nchar(proteinSeq))
+    try(peptideLength <- nchar(StrippedPeptide))
+    
+    #Get the start location of the peptide
+    try(start_position <- str_locate(proteinSeq, StrippedPeptide)[1])
+    
+    #Get AA before and after
+    try(AA_before <- substr(proteinSeq, (start_position -1), start_position -1))
+    try(AA_after <- substr(proteinSeq, (start_position + peptideLength), (start_position + peptideLength)))
+
+    #return all in one string, which we can use to transform back into columns later
+    return(paste0(proteinSeq_nchar, "_", peptideLength, "_", start_position, "_", AA_before, "_", AA_after))
+  }
+  
+  
+
+  #making a cleanDF with peptide and Uniprot column
+  dataset_clean <- dataset %>%
+    
+    #First, we make sure we have a peptide & Uniprot column, and that their naming is good. After, we select them.
+    mutate(Peptide = get(column_peptide),
+           Uniprot = get(column_uniprot)) %>%
+    dplyr::select(Peptide, Uniprot) 
+  
+  #Create the FASTA info
+  FASTAINFO <- dataset_clean %>%
+    
+    #based on if it is MSFragger or DIA-NN, there can be some other items hidden we need to get rid of.
+    mutate(strippedPeptide = gsub('[[:digit:]]+', '', Peptide)) %>%
+    mutate(strippedPeptide = gsub("\\[|\\]", "", strippedPeptide)) %>%
+    mutate(strippedPeptide = str_replace_all(strippedPeptide, ".UniMod..", "")) %>%
+    mutate(strippedPeptide = gsub("\\.", "", strippedPeptide)) %>%
+    
+    
+    #Use the function described above to get all FASTA related info
+    mutate(allInfo = mapply(function(x,y) proteinStringFunction(x, y),
+                                  Uniprot, strippedPeptide)) %>%
+    separate(allInfo, sep = "_", into = c("proteinLength", "peptideLength", "startPosition", "AAbefore", "AAafter")) %>%
+    mutate(proteinLength = as.numeric(proteinLength),
+           startPosition = as.numeric(startPosition),
+           peptideLength = as.numeric(peptideLength))
+
+  #Join them together again. We do the @ thing to remove the duplicate names
+  returnDF <- inner_join(FASTAINFO,
+                         dataset,
+                         suffix = c("", ".@"),
+                         by = c("Peptide" = "Peptide")) %>%
+    select(-ends_with(".@"))
+  
+  return(returnDF)
+
+}
+```
+
+#### Usage
+
+To use we need to manually split the peptide-sequences from the other identifiers in the column. Here we have a UNIPROT_GENE_PEPTIDE type, so lets do that.
+
+After that we specify the FASTA file, the dataset, and the peptide-column.
+
+```{r}
+#Do the split
+resultsDF <- resultsDF %>%
+  separate(protOrPepName, sep = "_", into = c("Uniprot", "Gene", "Peptide"))
+
+#apply the function described above to get the DF as we want it.
+resultsDF_withFASTAINFO <- addFASTAinfo(
+    FASTA = myFastaFile,
+    dataset = resultsDF,
+    column_peptide = "Peptide",
+    column_uniprot = "Uniprot"
+  )
+
+```
+### Plotting Peptide Results
+
+#### Example
+
+Here it really depends what you want to plot. You need to have a rough understanding of GGplot, otherwise you cant make it look as you want. See below an example of the peptides across the protein sequence of  where I plot the adjusted p-values for the T-test.
+
+```{r}
+#We need to select the protein we want first
+proteinWeWantToPlot <- resultsDF_withFASTAINFO %>%
+  filter(Uniprot == "E9PAV3") 
+
+
+#Now we can make the plot
+proteinWeWantToPlot %>%
+  
+  #Lets make a column based on significance
+  mutate(isSignificant = ifelse(Control_1_Disease_1_adj_pvalue < 0.05, "yes", "no")) %>%
+  
+  #Start plotting
+  ggplot() +
+  
+  #We take here the 'mean' but this is of course X-times the same value
+  #ylim(-2.5, 2.5)
+  xlim(-10, mean(proteinWeWantToPlot$proteinLength)+10) + 
+  
+  #Create some lines to help visualise the start and end of the protein.
+  geom_vline(xintercept = 0, lwd = 2, alpha = .5) +
+  geom_vline(xintercept = mean(proteinWeWantToPlot$proteinLength), lwd = 2, alpha = 0.5) +
+  
+  #set a horizontal line to inform about FC = 0
+  geom_hline(yintercept = 0, color = "black") +
+  
+  #Here we build the peptide "blocks". Do note that all column-info goes INSIDE the aes() part.
+  geom_rect(
+      aes(
+      xmin = startPosition,
+      xmax = (startPosition + peptideLength),
+      ymin = Control_1_Disease_1_FC-0.05,
+      ymax = Control_1_Disease_1_FC+0.05,
+      fill = isSignificant
+      ),
+    
+    #Here I specify some stuff that will be universal for all blocks irrespective of column info.
+    col = "black",
+    alpha = 0.75) +
+  
+  #Set the Ggplot theme, limit the y-axis for FC.
+  theme_bw() +
+  ylim(-2, 2) +
+  
+  #Specify the colours I want to use for the isSignificant column
+  scale_fill_manual(values = c("yes" = "red","no" = "grey")) +
+  theme(legend.position = "bottom") +
+  
+  #x and yaxis titles
+  xlab("Protein Sequence") +
+  ylab("FC") 
+
+```
+#### Plot all
+
+In some cases you just want plots of ALL proteins in your dataset. We can do this using a for-loop. If you do not know what a for-loop is, please had back to chapter 0 and re-learn some R...
+
+In the for-loop we will go over each unique protein in the DF, make the plot and save it. that is all.
+
+```{r}
+#Create the for, using UNIQUE protein names
+for (i in unique(resultsDF_withFASTAINFO$Gene)){
+  
+    
+  #We need to select the protein we want first
+  proteinWeWantToPlot <- resultsDF_withFASTAINFO %>%
+    filter(Gene == i) 
+  
+  
+  #Now we can make the plot
+  proteinPeptidePlot <- proteinWeWantToPlot %>%
+    
+    #Lets make a column based on significance
+    mutate(isSignificant = ifelse(Control_1_Disease_1_adj_pvalue < 0.05, "yes", "no")) %>%
+    
+    #Start plotting
+    ggplot() +
+    
+    #We take here the 'mean' but this is of course X-times the same value
+    #ylim(-2.5, 2.5)
+    xlim(-10, mean(proteinWeWantToPlot$proteinLength)+10) + 
+    
+    #Create some lines to help visualise the start and end of the protein.
+    geom_vline(xintercept = 0, lwd = 2, alpha = .5) +
+    geom_vline(xintercept = mean(proteinWeWantToPlot$proteinLength), lwd = 2, alpha = 0.5) +
+    
+    #set a horizontal line to inform about FC = 0
+    geom_hline(yintercept = 0, color = "black") +
+    
+    #Here we build the peptide "blocks". Do note that all column-info goes INSIDE the aes() part.
+    geom_rect(
+        aes(
+        xmin = startPosition,
+        xmax = (startPosition + peptideLength),
+        ymin = Control_1_Disease_1_FC-0.05,
+        ymax = Control_1_Disease_1_FC+0.05,
+        fill = isSignificant
+        ),
+      
+      #Here I specify some stuff that will be universal for all blocks irrespective of column info.
+      col = "black",
+      alpha = 0.75) +
+    
+    #Set the Ggplot theme, limit the y-axis for FC.
+    theme_bw() +
+    ylim(-5, 5) +
+    
+    #Specify the colours I want to use for the isSignificant column
+    scale_fill_manual(values = c("yes" = "red","no" = "grey")) +
+    theme(legend.position = "bottom") +
+    
+    #x and yaxis titles
+    xlab("Protein Sequence") +
+    ylab("FC") 
+
+  #Here we plot them in the Rmarkdown.
+  plot(proteinPeptidePlot)
+  
+  #want to save them on the computer? Instead, run the part I commented here below.
+  # i here defines the GeneName
+  #ggsave(paste0("C:/Users/maste/Dropbox (BCH)/MyFolder1/Myfolder2/", i, ".png"))
+}
+```
+
+
+```{r}
+
+
+test <- read.csv("ExampleOfDifferentPvals.csv")
+
+test %>%
+  t_test(intensityName ~ grouping)
+
+test %>%
+  anova_test(intensityName ~ grouping, detailed = T)
+
+```
+
+
