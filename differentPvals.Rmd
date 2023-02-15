@@ -1,0 +1,32 @@
+---
+title: "PvalIssue"
+output: html_document
+date: "2023-02-08"
+---
+
+```{r}
+library(tidyverse)
+library(rstatix)
+
+test <- read.csv("ExampleOfDifferentPvals.csv")
+
+#Works
+test %>%
+  mutate(grouping = as.factor(grouping)) %>%
+  t_test(SMTH ~ grouping)
+
+test %>%
+  mutate(grouping = as.factor(grouping)) %>%
+  anova_test(SMTH ~ grouping, detailed = T)
+
+#not
+test %>%
+  mutate(grouping = as.factor(grouping)) %>%
+  t_test(intensityName ~ grouping)
+
+
+test %>%
+  mutate(grouping = as.factor(grouping)) %>%
+  anova_test(intensityName ~ grouping, detailed = T)
+```
+
